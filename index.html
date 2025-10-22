@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OtoRec — 音声録音・再生</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif;color:#111}
+    body{margin:20px;background:#f7f9fc}
+    .app{max-width:900px;margin:0 auto;padding:20px;background:#fff;border-radius:8px;box-shadow:0 6px 18px rgba(20,30,50,.08)}
+    h1{margin:0 0 12px;font-size:20px}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+    button{padding:8px 12px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;cursor:pointer}
+    button.primary{background:#2563eb;color:#fff;border-color:transparent}
+    button.warn{background:#ef4444;color:#fff;border-color:transparent}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .meter{width:160px;height:20px;background:#e6eefc;border-radius:6px;overflow:hidden;position:relative}
+    .meter-fill{height:100%;background:linear-gradient(90deg,#34d399,#06b6d4);width:0%}
+    /* ルーラーを入れるので少し高さを増やす */
+    canvas.wave{width:100%;height:96px;background:#0b1220;border-radius:6px;display:block;touch-action:none;outline:none}
+    select,input{padding:6px;border-radius:6px;border:1px solid #cbd5e1}
+  </style>
+  <!-- MP3 エンコード用（lamejs） -->
+  <script src="https://unpkg.com/lamejs@1.2.0/lame.min.js"></script>
+</head>
+<body>
+  <div class="app">
+    <h1>OtoRec — 音声録音・再生</h1>
+
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <label>
+        マイク:
+        <select id="inputSelect"></select>
+      </label>
+      <label>
+        最大録音時間:
+        <input id="maxSec" type="number" value="300" min="1" style="width:90px">
+        秒
+      </label>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn" class="primary">録音開始</button>
+      <button id="stopBtn" disabled>録音停止</button>
+
+      <button id="playStartBtn" disabled>再生（先頭から）</button>
+      <button id="pauseBtn" disabled>一時停止/再開</button>
+
+      <button id="downloadBtn" disabled>MP3でダウンロード</button>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="meter" title="入力レベル"><div id="meterFill" class="meter-fill"></div></div>
+      </div>
+      <div style="min-width:90px">
+        <div style="font-size:14px">経過: <span id="timer">00:00</span></div>
+      </div>
+    </div>
+
+    <canvas id="wave" class="wave" tabindex="0" aria-label="トリミング編集キャンバス"></canvas>
+  </div>
+
+  <script>
+    // 要素
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
+    const playStartBtn = document.getElementById('playStartBtn'); // 先頭（トリム開始）から再生
+    const pauseBtn = document.getElementById('pauseBtn');         // 再生/一時停止トグル
+
+    const downloadBtn = document.getElementById('downloadBtn');
+    const meterFill = document.getElementById('meterFill');
+    const timerEl = document.getElementById('timer');
+    const waveCanvas = document.getElementById('wave');
+    const inputSelect = document.getElementById('inputSelect');
+    const maxSecInput = document.getElementById('maxSec');
+
+    // 内部録音 MIME（OGG固定狙い、未対応ならWebMへ）
+    const PREFERRED_REC_MIME = 'audio/ogg;codecs=opus';
+    const FALLBACK_REC_MIME  = 'audio/webm;codecs=opus';
+
+    // ---- ルーラー寸法（DPR考慮） ----
+    const RULER_FONT_PX = 8;       // 論理フォントサイズ
+    const RULER_MIN_LOGICAL_PX = 14; // ルーラー最低高さ（論理px）
+    const TICK_MAJOR_PX = 4;        // 主要目盛り長（論理px）
+    const TICK_MINOR_PX = 2;        // 補助目盛り長（論理px）
+    const LABEL_PADDING_TOP_PX = 2; // 主要目盛りの先からラベルまでの余白（論理px）
+
+    let stream = null;
+    let mediaRecorder = null;
+    let chunks = [];
+    let audioCtx = null;
+    let analyser = null;
+    let sourceNode = null;
+    let liveRaf = null;
+    let startTime = 0;
+    let timerInterval = null;
+
+    // 最新1件のみ保持
+    let currentRecording = null; // { blob, url, createdAt, duration, mime, audioBuffer? }
+
+    // 再生用
+    const player = new Audio();
+
+    // 波形描画
+    let playheadRaf = null;
+    const waveBg = document.createElement('canvas');
+
+    // トリム
+    let trimStartSec = 0, trimEndSec = 0;
+    const MIN_TRIM_LEN = 0.1;
+
+    // トリムUI（キャンバス）操作用
+    const HANDLE_HIT_PX = 12;
+    const HANDLE_RADIUS = 6;
+    let dragging = null; // 'start' | 'end' | null
+
+    // --- 再生UIの状態管理 ---
+    function setPlaybackButtonsState() {
+      const hasRec = !!currentRecording;
+      playStartBtn.disabled = !hasRec;
+      pauseBtn.disabled = !hasRec;
+    }
+
+    // === プレイヤーイベント ===
+    player.addEventListener('play', () => { startPlayheadLoop(); });
+    player.addEventListener('pause', () => { stopPlayheadLoop(true); });
+
+    // 端で止める（オーバーラン抑止）
+    player.addEventListener('timeupdate', () => {
+      if (!currentRecording) return;
+      const EPS = 0.01; // 10ms 余裕
+      if (player.currentTime >= trimEndSec - EPS) {
+        player.pause();
+        try { player.currentTime = trimEndSec; } catch {}
+        renderWaveWithPlayhead(progressClampedForDraw());
+        stopPlayheadLoop(true);
+      } else if (player.currentTime < trimStartSec) {
+        try { player.currentTime = trimStartSec; } catch {}
+      }
+    });
+
+    // --- デバイス列挙 ---
+    async function enumerateInputs() {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const inputs = devices.filter(d => d.kind === 'audioinput');
+
+        inputSelect.innerHTML = '';
+        inputs.forEach((d, idx) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `マイク ${idx + 1}`;
+          inputSelect.appendChild(opt);
+        });
+
+        startBtn.disabled = inputs.length === 0;
+        if (inputs.length === 0) {
+          const opt = document.createElement('option'); opt.value = ''; opt.textContent = 'マイクが見つかりません';
+          inputSelect.appendChild(opt);
+        }
+      } catch (e) {
+        console.error('マイク列挙エラー:', e);
+        inputSelect.innerHTML = '';
+        const opt = document.createElement('option'); opt.value = ''; opt.textContent = 'マイクへのアクセスが拒否されました';
+        inputSelect.appendChild(opt);
+        startBtn.disabled = true;
+      }
+    }
+
+    // --- マイク開始 ---
+    async function startStream() {
+      try {
+        if (stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
+        const constraints = {
+          audio: {
+            deviceId: inputSelect.value ? { exact: inputSelect.value } : undefined,
+            echoCancellation: true, noiseSuppression: true, autoGainControl: true
+          }
+        };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        return stream;
+      } catch (err) {
+        console.error('マイク取得エラー:', err);
+        alert('マイクの取得に失敗しました: ' + err.message);
+        throw err;
+      }
+    }
+
+    // --- 入力レベル＆ライブ波形 ---
+    function startAnalyser(s) {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+      if (sourceNode) sourceNode.disconnect();
+      sourceNode = audioCtx.createMediaStreamSource(s);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      sourceNode.connect(analyser);
+      startLiveWave();
+      updateMeter();
+    }
+    function stopAnalyser() {
+      if (liveRaf) cancelAnimationFrame(liveRaf);
+      liveRaf = null;
+      if (sourceNode) sourceNode.disconnect();
+      if (analyser) analyser.disconnect();
+      analyser = null;
+
+      // ★録音停止時にレベルメーターをクリア
+      meterFill.style.width = '0%';
+    }
+
+    // 描画用サイズ情報（フォント・目盛り長を考慮してルーラー高さを決定）
+    function getDrawSizes(canvas) {
+      const dpr = devicePixelRatio || 1;
+      const width = canvas.width = Math.floor(canvas.clientWidth * dpr);
+      const height = canvas.height = Math.floor(canvas.clientHeight * dpr);
+
+      const fontPx = Math.round(RULER_FONT_PX * dpr);
+      const majorTick = Math.round(TICK_MAJOR_PX * dpr);
+      const padTop = Math.round(LABEL_PADDING_TOP_PX * dpr);
+      const minRuler = Math.round(RULER_MIN_LOGICAL_PX * dpr);
+
+      // 主要目盛り + 余白 + フォントが収まる最低高さ
+      const needed = majorTick + padTop + fontPx + Math.round(2 * dpr);
+      const rulerH = Math.max(minRuler, needed);
+
+      const waveH = Math.max(1, height - rulerH);
+      return { dpr, width, height, waveH, rulerH, fontPx, majorTick, padTop };
+    }
+
+    function startLiveWave() {
+      if (!analyser) return;
+      const ctx = waveCanvas.getContext('2d');
+      const sizes = getDrawSizes(waveCanvas);
+      const bufferLength = analyser.fftSize;
+      const data = new Uint8Array(bufferLength);
+
+      (function loop(){
+        liveRaf = requestAnimationFrame(loop);
+        analyser.getByteTimeDomainData(data);
+
+        // 背景
+        ctx.fillStyle = '#0b1220'; ctx.fillRect(0,0,sizes.width,sizes.height);
+
+        // 波形（上部）
+        ctx.lineWidth = 2 * sizes.dpr; ctx.strokeStyle = '#7dd3fc';
+        ctx.beginPath();
+        const sliceWidth = sizes.width / bufferLength;
+        const mid = sizes.waveH / 2;
+        let x = 0;
+        for (let i=0;i<bufferLength;i++){
+          const v = data[i] / 128.0; const y = v * (sizes.waveH/2);
+          if (i===0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+          x += sliceWidth;
+        }
+        ctx.lineTo(sizes.width, mid);
+        ctx.stroke();
+
+        // ルーラー
+        drawTimeRuler(ctx, sizes, parseFloat(maxSecInput.value || '300'));
+      })();
+    }
+
+    function updateMeter() {
+      if (!analyser) return;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      (function loop(){
+        if (!analyser) return;
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a,b)=>a+b,0) / data.length;
+        meterFill.style.width = Math.min(100, Math.round((avg / 255) * 100)) + '%';
+        requestAnimationFrame(loop);
+      })();
+    }
+
+    // --- タイマー ---
+    function formatTime(sec) {
+      const s = Math.floor(sec % 60).toString().padStart(2,'0');
+      const m = Math.floor(sec / 60).toString().padStart(2,'0');
+      return `${m}:${s}`;
+    }
+    function startTimer() {
+      startTime = Date.now();
+      timerInterval = setInterval(()=> {
+        const elapsed = Math.floor((Date.now()-startTime)/1000);
+        timerEl.textContent = formatTime(elapsed);
+        const max = parseInt(maxSecInput.value || '300',10);
+        if (elapsed >= max) stopRecording();
+      }, 250);
+    }
+    function stopTimer() {
+      clearInterval(timerInterval); timerInterval = null; timerEl.textContent = '00:00';
+    }
+
+    // --- 座標変換（波形エリア基準のX） ---
+    function secToX(sec) {
+      const dur = currentRecording?.duration || 1;
+      return (sec / dur) * waveCanvas.width;
+    }
+    function xToSec(x) {
+      const dur = currentRecording?.duration || 1;
+      return (x / waveCanvas.width) * dur;
+    }
+
+    // --- ルーラー描画 ---
+    function chooseTickStep(duration) {
+      const dpr = devicePixelRatio || 1;
+      const pxTarget = 80 * dpr;
+      const candidates = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+      const pxPerSec = waveCanvas.width / Math.max(1e-6, duration);
+      for (const step of candidates) {
+        if (step * pxPerSec >= pxTarget) return step;
+      }
+      return candidates[candidates.length - 1];
+    }
+
+    function drawTimeRuler(ctx, sizes, duration) {
+      const { width, height, waveH, rulerH, dpr, fontPx, majorTick, padTop } = sizes;
+      const minorTick = Math.round(TICK_MINOR_PX * dpr);
+      const baseY = waveH + 0.5; // ルーラーの上端
+
+      // ルーラー領域でクリップ（描画の取りこぼしを防止）
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, waveH, width, rulerH);
+      ctx.clip();
+
+      // 背景（濃色固定）
+      ctx.fillStyle = '#0d1117';
+      ctx.fillRect(0, waveH, width, rulerH);
+
+      // 上端ライン
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(0, baseY);
+      ctx.lineTo(width, baseY);
+      ctx.stroke();
+
+      if (currentRecording && currentRecording.duration) {
+        duration = currentRecording.duration;
+      }
+
+      const step = chooseTickStep(duration);
+      const pxPerSec = width / duration;
+
+      // テキスト
+      ctx.font = `${fontPx}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.shadowColor = 'rgba(0,0,0,0.35)';
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = Math.max(1, Math.round(1*dpr));
+
+      const labelBaseY = baseY + majorTick + padTop + fontPx;
+
+      // 目盛り＆ラベル
+      ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+      ctx.lineWidth = 1 * dpr;
+
+      const end = duration;
+      for (let t = 0; t <= end + 1e-6; t += step) {
+        const x = Math.round(t * pxPerSec) + 0.5;
+        const isMajor = (Math.round((t / step)) % 2 === 0) || step >= 10;
+
+        // 右端に極端に近い最終目盛りのラベルはスキップ（終端ラベルで上書き）
+        const nearRight = (width - x) <= (fontPx * 3); // 右端からフォント約3文字分以内
+        const isLastTick = (end - t) < step * 0.5 || nearRight;
+
+        // 目盛り線
+        ctx.beginPath();
+        ctx.moveTo(x, baseY);
+        ctx.lineTo(x, baseY + (isMajor ? majorTick : minorTick));
+        ctx.stroke();
+
+        // ラベル（主要目盛）— 最終目盛りは描かない
+        if (isMajor && !isLastTick) {
+          const label = t >= 60
+            ? `${Math.floor(t/60)}:${Math.floor(t%60).toString().padStart(2,'0')}`
+            : `${Math.floor(t)}`;
+          ctx.fillText(label, x + 4 * dpr, labelBaseY);
+        }
+      }
+
+      // 左端と終端ラベル（被りなし）
+      ctx.fillText('0', 4 * dpr, labelBaseY);
+      const endLabel = duration >= 60
+        ? `${Math.floor(duration/60)}:${Math.floor(duration%60).toString().padStart(2,'0')}`
+        : `${Math.floor(duration)}`;
+      const textWidth = ctx.measureText(endLabel).width;
+      ctx.fillText(endLabel, width - textWidth - 4 * dpr, labelBaseY);
+
+      // シャドウ解除＆クリップ解除
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 0;
+      ctx.restore();
+    }
+
+    // --- プレイヘッド & トリム描画 ---
+    function drawHandles(ctx, startX, endX, waveH) {
+      const r = HANDLE_RADIUS * (devicePixelRatio || 1);
+      ctx.save();
+      ctx.fillStyle = '#f59e0b';
+      ctx.strokeStyle = '#111827';
+      ctx.lineWidth = 1 * (devicePixelRatio || 1);
+
+      // start
+      ctx.beginPath();
+      ctx.arc(startX, waveH/2, r, 0, Math.PI * 2);
+      ctx.fill(); ctx.stroke();
+
+      // end
+      ctx.beginPath();
+      ctx.arc(endX, waveH/2, r, 0, Math.PI * 2);
+      ctx.fill(); ctx.stroke();
+
+      // selection lines
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 2 * (devicePixelRatio || 1);
+      ctx.beginPath();
+      ctx.moveTo(startX, 0); ctx.lineTo(startX, waveH);
+      ctx.moveTo(endX, 0); ctx.lineTo(endX, waveH);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function progressClampedForDraw() {
+      if (!currentRecording) return 0;
+      const dur = currentRecording.duration || 1;
+      const t = Math.min(Math.max(player.currentTime || trimStartSec, trimStartSec), trimEndSec);
+      return (t / dur);
+    }
+
+    function renderWaveWithPlayhead(progress = 0) {
+      const ctx = waveCanvas.getContext('2d');
+      const sizes = getDrawSizes(waveCanvas);
+      const { width, height, waveH } = sizes;
+
+      // 背景全体
+      ctx.fillStyle = '#0b1220';
+      ctx.fillRect(0, 0, width, height);
+
+      // 背景波形（オフスクリーンは波形領域サイズ）
+      ctx.drawImage(waveBg, 0, 0, waveBg.width, waveBg.height, 0, 0, width, waveH);
+
+      if (currentRecording && currentRecording.duration) {
+        const startX = secToX(trimStartSec);
+        const endX   = secToX(trimEndSec);
+
+        // トリムマスク（波形エリアのみ）
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        if (startX > 0) ctx.fillRect(0, 0, startX, waveH);
+        if (endX < width) ctx.fillRect(endX, 0, width - endX, waveH);
+        ctx.restore();
+
+        // ハンドル（波形エリア内）
+        drawHandles(ctx, startX, endX, waveH);
+      }
+
+      // プレイヘッド（波形エリア内）
+      const prog = Math.max(0, Math.min(1, progress));
+      const x = prog * width;
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2 * (devicePixelRatio || 1);
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, 0);
+      ctx.lineTo(x + 0.5, waveH);
+      ctx.stroke();
+      ctx.restore();
+
+      // ルーラー
+      const durationForRuler = currentRecording?.duration || parseFloat(maxSecInput.value || '300');
+      drawTimeRuler(ctx, sizes, durationForRuler);
+    }
+
+    function startPlayheadLoop() {
+      stopPlayheadLoop();
+      const loop = () => {
+        if (!currentRecording || player.paused) return;
+        renderWaveWithPlayhead(progressClampedForDraw());
+        playheadRaf = requestAnimationFrame(loop);
+      };
+      playheadRaf = requestAnimationFrame(loop);
+    }
+    function stopPlayheadLoop(keepFrame = false) {
+      if (playheadRaf) cancelAnimationFrame(playheadRaf);
+      playheadRaf = null;
+      if (!keepFrame && currentRecording) renderWaveWithPlayhead(progressClampedForDraw());
+    }
+
+    // --- 再生（要件どおり・トリム対応） ---
+    async function playFromStart() {
+      if (!currentRecording) return;
+      if (player.src !== currentRecording.url) player.src = currentRecording.url;
+
+      try { await player.play(); } catch {}
+      try { player.currentTime = trimStartSec; } catch {}
+      if (player.paused) { try { await player.play(); } catch {} }
+
+      renderWaveWithPlayhead(progressClampedForDraw());
+    }
+
+    async function togglePauseResume() {
+      if (!currentRecording) return;
+      if (!player.src) player.src = currentRecording.url;
+      if (player.paused) {
+        if (player.currentTime < trimStartSec || player.currentTime >= trimEndSec) {
+          try { player.currentTime = trimStartSec; } catch {}
+        }
+        try { await player.play(); } catch (e) { console.error('再開エラー:', e); }
+      } else {
+        player.pause();
+      }
+    }
+
+    function stopPlaybackIfAny() { player.pause(); }
+
+    // --- MP3 変換＆ダウンロード（トリム範囲のみ） ---
+    async function downloadAsMp3(rec) {
+      if (!rec) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume().catch(()=>{});
+        let audioBuffer = rec.audioBuffer;
+        if (!audioBuffer) {
+          const buf = await rec.blob.arrayBuffer();
+          audioBuffer = await audioCtx.decodeAudioData(buf);
+          rec.audioBuffer = audioBuffer;
+        }
+        const mp3Blob = pcmSegmentToMp3(audioBuffer, trimStartSec, trimEndSec, 128);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(mp3Blob);
+        a.download = `recording_${rec.createdAt.toISOString().replace(/[:.]/g,'-')}_trim.mp3`;
+        a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+      } catch (e) {
+        console.error('MP3 変換エラー:', e);
+        alert('MP3 変換に失敗しました: ' + (e.message || e));
+      }
+    }
+    function floatTo16BitPCM(float32Array) {
+      const len = float32Array.length;
+      const int16 = new Int16Array(len);
+      for (let i = 0; i < len; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return int16;
+    }
+    function pcmSegmentToMp3(audioBuffer, startSec, endSec, kbps = 128) {
+      const numCh = audioBuffer.numberOfChannels;
+      const sampleRate = audioBuffer.sampleRate;
+      const blockSize = 1152;
+
+      const startSample = Math.max(0, Math.floor(startSec * sampleRate));
+      const endSample   = Math.min(Math.floor(endSec * sampleRate), audioBuffer.length);
+      const length = Math.max(0, endSample - startSample);
+
+      const encoder = new lamejs.Mp3Encoder(Math.min(numCh,2), sampleRate, kbps);
+      const mp3Data = [];
+
+      if (numCh >= 2) {
+        const left = floatTo16BitPCM(audioBuffer.getChannelData(0).subarray(startSample, endSample));
+        const right = floatTo16BitPCM(audioBuffer.getChannelData(1).subarray(startSample, endSample));
+        for (let i = 0; i < length; i += blockSize) {
+          const mp3buf = encoder.encodeBuffer(
+            left.subarray(i, i + blockSize),
+            right.subarray(i, i + blockSize)
+          );
+          if (mp3buf.length > 0) mp3Data.push(mp3buf);
+        }
+      } else {
+        const mono = floatTo16BitPCM(audioBuffer.getChannelData(0).subarray(startSample, endSample));
+        for (let i = 0; i < mono.length; i += blockSize) {
+          const mp3buf = encoder.encodeBuffer(mono.subarray(i, i + blockSize));
+          if (mp3buf.length > 0) mp3Data.push(mp3buf);
+        }
+      }
+      const end = encoder.flush();
+      if (end.length > 0) mp3Data.push(end);
+      return new Blob(mp3Data, { type: 'audio/mpeg' });
+    }
+
+    // --- 録音 ---
+    async function startRecording() {
+      try {
+        stopPlaybackIfAny();
+        if (currentRecording) {
+          URL.revokeObjectURL(currentRecording.url);
+          currentRecording = null;
+          setPlaybackButtonsState();
+          downloadBtn.disabled = true;
+        }
+
+        await enumerateInputs();
+        const s = await startStream();
+        startAnalyser(s);
+
+        let recMime = '';
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(PREFERRED_REC_MIME)) {
+          recMime = PREFERRED_REC_MIME;
+        } else if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(FALLBACK_REC_MIME)) {
+          recMime = FALLBACK_REC_MIME;
+          console.warn('OGG未対応のため WebM/Opus にフォールバックします');
+        } else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) {
+          recMime = 'audio/webm';
+        } else {
+          recMime = ''; // ブラウザ任せ
+        }
+
+        const options = recMime ? { mimeType: recMime } : undefined;
+        mediaRecorder = new MediaRecorder(s, options);
+        chunks = [];
+
+        mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+
+        mediaRecorder.onstop = async () => {
+          const mime = recMime || 'audio/webm';
+          const blob = new Blob(chunks, { type: mime });
+          const url = URL.createObjectURL(blob);
+          const createdAt = new Date();
+
+          currentRecording = { blob, url, createdAt, duration: 0, mime: blob.type };
+
+          downloadBtn.disabled = false;
+          downloadBtn.onclick = () => downloadAsMp3(currentRecording);
+
+          // 波形背景 & decode
+          try {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') await audioCtx.resume().catch(()=>{});
+            const arrayBuffer = await currentRecording.blob.arrayBuffer();
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            currentRecording.audioBuffer = audioBuffer;
+            currentRecording.duration = audioBuffer.duration;
+
+            // トリム初期化（全体選択）
+            trimStartSec = 0;
+            trimEndSec   = audioBuffer.duration;
+
+            drawFullWaveformToBackground(audioBuffer);
+            renderWaveWithPlayhead(0);
+          } catch (err) { console.error('波形描画エラー:', err); }
+
+          setPlaybackButtonsState();
+        };
+
+        mediaRecorder.start(250);
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+
+        playStartBtn.disabled = true; // 録音中は再生不可
+        pauseBtn.disabled = true;
+
+        startTimer();
+      } catch (err) {
+        alert('マイクへのアクセスに失敗しました: ' + (err.message || err));
+        console.error(err);
+        startBtn.disabled = false; stopBtn.disabled = true; setPlaybackButtonsState();
+      }
+    }
+
+    function stopRecording() {
+      if (!mediaRecorder) return;
+      if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      startBtn.disabled = false; stopBtn.disabled = true;
+      stopAnalyser(); stopTimer();
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    }
+
+    // 波形をオフスクリーンへ描画（波形エリアの高さに合わせる）
+    function drawFullWaveformToBackground(audioBuffer) {
+      const dpr = devicePixelRatio || 1;
+      const width = Math.floor(waveCanvas.clientWidth * dpr);
+      const height = Math.floor(waveCanvas.clientHeight * dpr);
+
+      // ルーラー分を引いた波形エリアの高さを算出
+      const fontPx = Math.round(RULER_FONT_PX * dpr);
+      const majorTick = Math.round(TICK_MAJOR_PX * dpr);
+      const padTop = Math.round(LABEL_PADDING_TOP_PX * dpr);
+      const minRuler = Math.round(RULER_MIN_LOGICAL_PX * dpr);
+      const needed = majorTick + padTop + fontPx + Math.round(2 * dpr);
+      const rulerH = Math.max(minRuler, needed);
+      const waveH = Math.max(1, height - rulerH);
+
+      waveBg.width = width;
+      waveBg.height = waveH;
+
+      const ctx = waveBg.getContext('2d');
+      ctx.fillStyle = '#0b1220'; ctx.fillRect(0, 0, width, waveH);
+
+      const data = audioBuffer.getChannelData(0);
+      const step = Math.ceil(data.length / width);
+      const amp = waveH / 2;
+
+      ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 1 * dpr; ctx.beginPath();
+
+      for (let i = 0; i < width; i++) {
+        let min = 1.0, max = -1.0;
+        for (let j = 0; j < step; j++) {
+          const idx = (i * step) + j; if (idx >= data.length) break;
+          const v = data[idx]; if (v < min) min = v; if (v > max) max = v;
+        }
+        const y1 = (1 + min) * amp; const y2 = (1 + max) * amp;
+        ctx.moveTo(i, y1); ctx.lineTo(i, y2);
+      }
+      ctx.stroke();
+    }
+
+    // === キャンバスでのトリム操作 ===
+    function handleAt(x) {
+      const sx = secToX(trimStartSec);
+      const ex = secToX(trimEndSec);
+      const dxStart = Math.abs(x - sx);
+      const dxEnd   = Math.abs(x - ex);
+      const hit = HANDLE_HIT_PX * (devicePixelRatio || 1);
+      if (dxStart <= hit && dxStart <= dxEnd) return 'start';
+      if (dxEnd <= hit) return 'end';
+      return null;
+    }
+
+    waveCanvas.addEventListener('pointerdown', (e) => {
+      if (!currentRecording) return;
+      waveCanvas.setPointerCapture(e.pointerId);
+      const rect = waveCanvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (devicePixelRatio || 1);
+
+      const h = handleAt(x);
+      if (h) {
+        dragging = h;
+      } else {
+        const sx = secToX(trimStartSec);
+        const ex = secToX(trimEndSec);
+        dragging = (Math.abs(x - sx) < Math.abs(x - ex)) ? 'start' : 'end';
+      }
+      e.preventDefault();
+    });
+
+    waveCanvas.addEventListener('pointermove', (e) => {
+      if (!currentRecording) return;
+      const rect = waveCanvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (devicePixelRatio || 1);
+
+      const hover = handleAt(x);
+      waveCanvas.style.cursor = (hover ? 'ew-resize' : 'default');
+
+      if (!dragging) return;
+
+      const dur = currentRecording.duration || 0;
+      const secRaw = xToSec(x);
+      if (dragging === 'start') {
+        let s = Math.max(0, Math.min(secRaw, trimEndSec - MIN_TRIM_LEN));
+        trimStartSec = s;
+      } else if (dragging === 'end') {
+        let e2 = Math.min(dur, Math.max(secRaw, trimStartSec + MIN_TRIM_LEN));
+        trimEndSec = e2;
+      }
+
+      if (!player.paused && (player.currentTime < trimStartSec || player.currentTime > trimEndSec)) {
+        player.currentTime = trimStartSec;
+      }
+      renderWaveWithPlayhead(progressClampedForDraw());
+      e.preventDefault();
+    });
+
+    function endDrag(e){
+      if (!currentRecording) return;
+      if (!dragging) return;
+      dragging = null;
+      waveCanvas.releasePointerCapture?.(e.pointerId);
+    }
+    waveCanvas.addEventListener('pointerup', endDrag);
+    waveCanvas.addEventListener('pointercancel', endDrag);
+    waveCanvas.addEventListener('pointerleave', endDrag);
+
+    // キーボード微調整（キャンバスにフォーカス時）
+    waveCanvas.addEventListener('keydown', (e) => {
+      if (!currentRecording) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const dur = currentRecording.duration || 0;
+      const step = e.shiftKey ? 1.0 : 0.1;
+
+      const playT = player.paused ? trimStartSec : player.currentTime;
+      const playX = secToX(playT);
+      const sx = secToX(trimStartSec);
+      const ex = secToX(trimEndSec);
+      const target = Math.abs(playX - sx) <= Math.abs(playX - ex) ? 'start' : 'end';
+
+      if (target === 'start') {
+        trimStartSec = Math.max(0, Math.min(trimStartSec + (e.key === 'ArrowRight' ? step : -step), trimEndSec - MIN_TRIM_LEN));
+      } else {
+        trimEndSec = Math.min(dur, Math.max(trimEndSec + (e.key === 'ArrowRight' ? step : -step), trimStartSec + MIN_TRIM_LEN));
+      }
+
+      if (!player.paused && (player.currentTime < trimStartSec || player.currentTime > trimEndSec)) {
+        player.currentTime = trimStartSec;
+      }
+      renderWaveWithPlayhead(progressClampedForDraw());
+      e.preventDefault();
+    });
+
+    // --- UI イベント ---
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      try { await startRecording(); }
+      finally { if (!mediaRecorder || mediaRecorder.state === 'inactive') startBtn.disabled = false; }
+    });
+    stopBtn.addEventListener('click', () => stopRecording());
+
+    playStartBtn.addEventListener('click', () => { if (currentRecording) playFromStart(); });
+    pauseBtn.addEventListener('click', () => { if (currentRecording) togglePauseResume(); });
+
+    // --- 初期化 & リサイズ ---
+    (async function init(){
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('このブラウザは getUserMedia をサポートしていません。最新の Chrome/Edge/Firefox を推奨します。');
+        startBtn.disabled = true; return;
+      }
+      try {
+        await enumerateInputs();
+        navigator.mediaDevices.addEventListener('devicechange', enumerateInputs);
+
+        function resizeCanvas() {
+          const dpr = devicePixelRatio || 1;
+          waveCanvas.width  = Math.floor(waveCanvas.clientWidth * dpr);
+          waveCanvas.height = Math.floor(waveCanvas.clientHeight * dpr);
+          if (currentRecording) renderWaveWithPlayhead(progressClampedForDraw());
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        setPlaybackButtonsState();
+      } catch (err) { console.error('初期化エラー:', err); }
+    })();
+
+    inputSelect.addEventListener('change', async () => {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        if (!confirm('録音中ですが、マイクを切り替えますか？')) return;
+        stopRecording();
+      }
+      try { await startStream(); startBtn.disabled = false; }
+      catch (err) { console.error('マイク切替エラー:', err); startBtn.disabled = true; }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      if (currentRecording) URL.revokeObjectURL(currentRecording.url);
+    });
+  </script>
+</body>
+</html>
